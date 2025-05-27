@@ -1,4 +1,4 @@
-# PaiChat-Golang+Ollama LLM应用
+# PaiChat-Golang+Ollama LLM Service
 
 <div align="center">  
 
@@ -46,6 +46,11 @@ PaiChat/
 
 ---
 
+## Ollama + AstrBot 多平台LLM开发应用
+
+
+---
+
 ## 🚀 快速开始
 ### 环境要求
 - Go 1.20+
@@ -70,6 +75,8 @@ ollama stop model_name    //停止运行中模型
 curl -fsSL https://ollama.com/install.sh | sh
 ollama serve   
 ```
+可直接终端运行：
+![image](https://github.com/user-attachments/assets/8adf4ce1-7203-48f1-bc8f-562ae40ee7de)
 
 ### 启动方式 
 ```bash
