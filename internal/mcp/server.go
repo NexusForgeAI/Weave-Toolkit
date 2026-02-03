@@ -1,27 +1,26 @@
 package mcp
 
 import (
+	"Weave-Toolkit/config"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 
-	"Weave-Toolkit/config"
+	"Weave-Toolkit/internal/logger"
 	"Weave-Toolkit/internal/tools"
-
-	"github.com/rs/zerolog"
 )
 
 // Server MCP 服务器
 type Server struct {
 	config  *config.Config
-	logger  *zerolog.Logger
+	logger  *logger.Logger
 	httpSrv *http.Server
 	toolMgr *tools.ToolManager
 }
 
 // NewServer 创建新的 MCP 服务器
-func NewServer(cfg *config.Config, logger *zerolog.Logger) (*Server, error) {
+func NewServer(cfg *config.Config, logger *logger.Logger) (*Server, error) {
 	// 初始化工具管理器
 	toolManager := tools.NewToolManager(logger)
 

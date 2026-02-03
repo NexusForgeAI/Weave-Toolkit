@@ -4,14 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
-	"github.com/rs/zerolog"
+	"Weave-Toolkit/internal/logger"
 )
 
 // ToolManager MCP 工具管理器
 type ToolManager struct {
 	tools  map[string]Tool
-	logger *zerolog.Logger
+	logger *logger.Logger
 }
 
 // Tool 工具接口
@@ -40,7 +41,7 @@ type ToolCallContent struct {
 }
 
 // NewToolManager 创建新的工具管理器
-func NewToolManager(logger *zerolog.Logger) *ToolManager {
+func NewToolManager(logger *logger.Logger) *ToolManager {
 	return &ToolManager{
 		tools:  make(map[string]Tool),
 		logger: logger,
@@ -56,7 +57,6 @@ func (tm *ToolManager) RegisterTool(tool Tool) {
 // RegisterAllTools 注册所有可用工具
 func (tm *ToolManager) RegisterAllTools() {
 	tm.RegisterTool(&CalculatorTool{})
-	tm.RegisterTool(&FileTool{})
 	// 添加更多工具
 }
 
@@ -74,18 +74,42 @@ func (tm *ToolManager) GetTools() []ToolInfo {
 
 // CallTool 调用工具
 func (tm *ToolManager) CallTool(ctx context.Context, name string, args json.RawMessage) (*ToolCallResult, error) {
+	startTime := time.Now()
+
 	tool, exists := tm.tools[name]
 	if !exists {
+		tm.logger.Error().Str("tool", name).Msg("Tool not found")
 		return nil, fmt.Errorf("tool not found: %s", name)
 	}
 
-	tm.logger.Debug().Str("tool", name).Msg("Executing tool")
+	// 记录工具调用开始
+	tm.logger.Info().
+		Str("tool", name).
+		RawJSON("args", args).
+		Msg("Tool call started")
 
 	result, err := tool.Execute(ctx, args)
+	duration := time.Since(startTime)
+
+	// 记录工具调用结果
+	if err != nil {
+		tm.logger.Error().
+			Str("tool", name).
+			Dur("duration", duration).
+			Err(err).
+			Msg("Tool call failed")
+	} else {
+		tm.logger.Info().
+			Str("tool", name).
+			Dur("duration", duration).
+			Msg("Tool call completed successfully")
+	}
+
 	if err != nil {
 		return nil, err
 	}
 
+	// MCP 兼容格式
 	return &ToolCallResult{
 		Content: []ToolCallContent{
 			{
