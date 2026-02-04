@@ -1,12 +1,14 @@
 package mcp
 
 import (
-	"Weave-Toolkit/config"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 
+	"Weave-Toolkit/config"
 	"Weave-Toolkit/internal/logger"
 	"Weave-Toolkit/internal/tools"
 )
@@ -82,49 +84,150 @@ func (s *Server) handleMCPRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req MCPRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	// 读取请求体
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.sendErrorResponse(w, "Failed to read request body", -32700)
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	var req map[string]interface{}
+	if err := json.NewDecoder(bytes.NewBuffer(bodyBytes)).Decode(&req); err != nil {
+		s.sendErrorResponse(w, "Invalid JSON", -32700)
+		return
+	}
+
+	method, ok := req["method"].(string)
+	if !ok {
+		s.sendErrorResponse(w, "Missing or invalid method", -32600)
 		return
 	}
 
 	// 处理 MCP 请求
-	result, err := s.handleMCPOperation(r.Context(), req)
+	result, err := s.handleMCPOperation(r.Context(), method, req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.sendErrorResponse(w, err.Error(), -32603)
 		return
 	}
 
+	response := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"result":  result,
+		"id":      req["id"],
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	json.NewEncoder(w).Encode(response)
 }
 
-func (s *Server) handleMCPOperation(ctx context.Context, req MCPRequest) (interface{}, error) {
-	switch req.Method {
-	case "tools/list":
-		return s.toolMgr.GetTools(), nil
-	case "tools/call":
-		var callReq struct {
-			Name string          `json:"name"`
-			Args json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal(req.Params, &callReq); err != nil {
-			return nil, fmt.Errorf("invalid call parameters: %v", err)
-		}
-		return s.toolMgr.CallTool(ctx, callReq.Name, callReq.Args)
+func (s *Server) handleMCPOperation(ctx context.Context, method string, req map[string]interface{}) (interface{}, error) {
+	switch method {
+	case MethodInitialize:
+		return s.handleInitialize(req)
+	case "notifications/initialized":
+		return s.handleInitializedNotification(req)
+	case MethodToolsList:
+		return s.handleToolsList()
+	case MethodToolsCall:
+		return s.handleToolsCall(ctx, req)
 	default:
-		return nil, fmt.Errorf("unsupported method: %s", req.Method)
+		return nil, fmt.Errorf("unsupported method: %s", method)
 	}
+}
+
+func (s *Server) handleInitialize(req map[string]interface{}) (interface{}, error) {
+	response := map[string]interface{}{
+		"protocolVersion": ProtocolVersion,
+		"serverInfo": map[string]interface{}{
+			"name":    "Weave-Toolkit",
+			"version": "1.0.0",
+		},
+		"capabilities": map[string]interface{}{
+			"roots": map[string]interface{}{
+				"listChanged": false,
+			},
+			"resources": map[string]interface{}{
+				"listChanged": false,
+			},
+			"tools": map[string]interface{}{
+				"listChanged": false,
+			},
+			"prompts": map[string]interface{}{
+				"listChanged": false,
+			},
+		},
+	}
+
+	return response, nil
+}
+
+func (s *Server) handleInitializedNotification(req map[string]interface{}) (interface{}, error) {
+	return nil, nil
+}
+
+func (s *Server) handleToolsList() (interface{}, error) {
+	toolInfos := s.toolMgr.GetTools()
+
+	// MCP 协议格式
+	var tools []map[string]interface{}
+	for _, tool := range toolInfos {
+		tools = append(tools, map[string]interface{}{
+			"name":        tool.Name,
+			"description": tool.Description,
+			"inputSchema": map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		})
+	}
+
+	return map[string]interface{}{
+		"tools": tools,
+	}, nil
+}
+
+func (s *Server) handleToolsCall(ctx context.Context, req map[string]interface{}) (interface{}, error) {
+	params, ok := req["params"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid params")
+	}
+
+	toolName, ok := params["name"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing or invalid tool name")
+	}
+
+	arguments, err := json.Marshal(params["arguments"])
+	if err != nil {
+		return nil, fmt.Errorf("invalid arguments: %v", err)
+	}
+
+	result, err := s.toolMgr.CallTool(ctx, toolName, arguments)
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func (s *Server) sendErrorResponse(w http.ResponseWriter, message string, code int) {
+	response := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"error": map[string]interface{}{
+			"code":    code,
+			"message": message,
+		},
+		"id": nil,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(response)
 }
 
 func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status": "healthy"}`))
-}
-
-// MCPRequest MCP 请求结构
-type MCPRequest struct {
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
 }

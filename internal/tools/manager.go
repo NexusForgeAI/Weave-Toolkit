@@ -69,6 +69,9 @@ func (tm *ToolManager) GetTools() []ToolInfo {
 			Description: tool.Description(),
 		})
 	}
+	
+	// 记录工具列表
+	tm.logger.Info().Int("count", len(tools)).Msg("Returning tool list")
 	return tools
 }
 

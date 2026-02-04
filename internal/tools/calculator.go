@@ -11,9 +11,10 @@ type CalculatorTool struct{}
 
 // CalculatorArgs 计算器参数
 type CalculatorArgs struct {
-	Operation string  `json:"operation"` // add, subtract, multiply, divide
-	A         float64 `json:"a"`
-	B         float64 `json:"b"`
+	Operation string    `json:"operation"` // add, subtract, multiply, divide
+	A         float64   `json:"a"`
+	B         float64   `json:"b"`
+	Operands  []float64 `json:"operands"`
 }
 
 // CalculatorResult 计算结果
@@ -35,19 +36,29 @@ func (ct *CalculatorTool) Execute(ctx context.Context, args json.RawMessage) (js
 		return nil, fmt.Errorf("invalid arguments: %v", err)
 	}
 
+	// 支持两种参数格式：{"a":10,"b":20} 或 {"operands":[10,20]}
+	var a, b float64
+	if len(calcArgs.Operands) >= 2 {
+		a = calcArgs.Operands[0]
+		b = calcArgs.Operands[1]
+	} else {
+		a = calcArgs.A
+		b = calcArgs.B
+	}
+
 	var result float64
 	switch calcArgs.Operation {
 	case "add":
-		result = calcArgs.A + calcArgs.B
+		result = a + b
 	case "subtract":
-		result = calcArgs.A - calcArgs.B
+		result = a - b
 	case "multiply":
-		result = calcArgs.A * calcArgs.B
+		result = a * b
 	case "divide":
-		if calcArgs.B == 0 {
+		if b == 0 {
 			return nil, fmt.Errorf("division by zero")
 		}
-		result = calcArgs.A / calcArgs.B
+		result = a / b
 	default:
 		return nil, fmt.Errorf("unsupported operation: %s", calcArgs.Operation)
 	}
