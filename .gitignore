@@ -1,0 +1,129 @@
+# Go build artifacts
+bin/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go test artifacts
+*.test
+*.out
+coverage.txt
+
+# Go module files (but keep go.mod and go.sum)
+vendor/
+
+# Dependency directories
+node_modules/
+
+# Log files
+*.log
+logs/
+
+# Environment files (sensitive configuration)
+.env
+.env.local
+.env.*.local
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Build artifacts
+build/
+out/
+target/
+
+# Temporary files
+tmp/
+temp/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup files
+*.bak
+*.backup
+
+# Certificate files
+*.pem
+*.key
+*.crt
+*.csr
+
+# Docker artifacts
+.docker/
+
+# Documentation build artifacts
+docs/_build/
+
+# Profiling data
+*.prof
+*.pprof
+
+# Coverage reports
+coverage/
+htmlcov/
+
+# Package files
+*.deb
+*.rpm
+*.tar.gz
+*.zip
+
+# MacOS
+.AppleDouble
+.LSOverride
+
+# Windows
+[Tt]humbs.db
+*.[Cc]ache
+
+# Linux
+*~
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Go workspace file
+go.work
+
+# Local configuration files
+.local.env
+.env.local
+
+# Development tools
+.devcontainer/
+
+# Build cache
+.cache/
+
+# Package manager specific
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
