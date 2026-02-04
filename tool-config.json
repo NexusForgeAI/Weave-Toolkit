@@ -1,0 +1,34 @@
+{
+  "categories": {
+    "math": {
+      "enabled": true,
+      "max_tools": 15,
+      "rate_limit": 200,
+      "timeout": 30
+    },
+    "ai": {
+      "enabled": true,
+      "max_tools": 10,
+      "rate_limit": 20,
+      "timeout": 120
+    },
+    "system": {
+      "enabled": true,
+      "max_tools": 20,
+      "rate_limit": 300,
+      "timeout": 15
+    },
+    "utility": {
+      "enabled": true,
+      "max_tools": 30,
+      "rate_limit": 200,
+      "timeout": 20
+    }
+  },
+  "global": {
+    "max_concurrent_calls": 200,
+    "default_timeout": 60,
+    "enable_metrics": true,
+    "enable_tracing": false
+  }
+}

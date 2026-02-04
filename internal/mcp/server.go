@@ -24,7 +24,7 @@ type Server struct {
 // NewServer 创建新的 MCP 服务器
 func NewServer(cfg *config.Config, logger *logger.Logger) (*Server, error) {
 	// 初始化工具管理器
-	toolManager := tools.NewToolManager(logger)
+	toolManager := tools.NewToolManager(logger, &cfg.ToolConfig)
 
 	// 注册所有工具
 	toolManager.RegisterAllTools()
