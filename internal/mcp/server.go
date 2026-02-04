@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
+	"time"
 
 	"Weave-Toolkit/config"
 	"Weave-Toolkit/internal/logger"
@@ -15,16 +17,19 @@ import (
 
 // Server MCP 服务器
 type Server struct {
-	config  *config.Config
-	logger  *logger.Logger
-	httpSrv *http.Server
-	toolMgr *tools.ToolManager
+	config       *config.Config
+	logger       *logger.Logger
+	httpSrv      *http.Server
+	toolMgr      *tools.ToolManager
+	activeOps    sync.WaitGroup // 等待正在执行的操作
+	shuttingDown bool           // 关闭标志
+	shutdownMu   sync.RWMutex   // 关闭状态锁
 }
 
 // NewServer 创建新的 MCP 服务器
 func NewServer(cfg *config.Config, logger *logger.Logger) (*Server, error) {
 	// 初始化工具管理器
-	toolManager := tools.NewToolManager(logger)
+	toolManager := tools.NewToolManager(logger, &cfg.ToolConfig)
 
 	// 注册所有工具
 	toolManager.RegisterAllTools()
@@ -64,7 +69,37 @@ func (s *Server) Start(ctx context.Context) error {
 // Stop 停止 MCP 服务器
 func (s *Server) Stop() error {
 	s.logger.Info().Msg("Stopping MCP server")
+
+	// 设置关闭标志，拒绝新请求
+	s.shutdownMu.Lock()
+	s.shuttingDown = true
+	s.shutdownMu.Unlock()
+
+	s.logger.Info().Msg("Waiting for active operations to complete...")
+
+	// 等待所有正在执行的操作完成（最多等待30秒）
+	done := make(chan struct{})
+	go func() {
+		s.activeOps.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		s.logger.Info().Msg("All active operations completed")
+	case <-time.After(30 * time.Second):
+		s.logger.Warn().Msg("Timeout waiting for active operations, forcing shutdown")
+	}
+
+	// 关闭 HTTP 服务器
 	return s.httpSrv.Shutdown(context.Background())
+}
+
+// isShuttingDown 检查服务器是否正在关闭
+func (s *Server) isShuttingDown() bool {
+	s.shutdownMu.RLock()
+	defer s.shutdownMu.RUnlock()
+	return s.shuttingDown
 }
 
 func (s *Server) setupHTTPServer() {
@@ -79,10 +114,20 @@ func (s *Server) setupHTTPServer() {
 }
 
 func (s *Server) handleMCPRequest(w http.ResponseWriter, r *http.Request) {
+	// 检查服务器是否正在关闭
+	if s.isShuttingDown() {
+		http.Error(w, "Service unavailable - server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// 增加活跃操作计数
+	s.activeOps.Add(1)
+	defer s.activeOps.Done()
 
 	// 读取请求体
 	bodyBytes, err := io.ReadAll(r.Body)

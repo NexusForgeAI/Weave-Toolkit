@@ -30,6 +30,10 @@ func (ct *CalculatorTool) Description() string {
 	return "Perform basic arithmetic operations (add, subtract, multiply, divide)"
 }
 
+func (ct *CalculatorTool) Category() ToolCategory {
+	return CategoryMath
+}
+
 func (ct *CalculatorTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	var calcArgs CalculatorArgs
 	if err := json.Unmarshal(args, &calcArgs); err != nil {

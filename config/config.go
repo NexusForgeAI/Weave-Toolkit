@@ -1,95 +1,138 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/joho/godotenv"
 )
 
-// Config 服务器配置
+// Config 应用配置
 type Config struct {
-	ServerAddress  string
-	LogLevel       string
-	LogDir         string
-	MaxConnections int
-	ToolTimeout    time.Duration
-	MaxRequestSize int64
-	ReadTimeout    time.Duration
-	WriteTimeout   time.Duration
-	IdleTimeout    time.Duration
-	APIKey         string
-	CORSOrigin     string
+	ServerAddress  string            `json:"server_address"`
+	LogLevel       string            `json:"log_level"`
+	LogDir         string            `json:"log_dir"`
+	MaxConnections int               `json:"max_connections"`
+	ToolTimeout    time.Duration     `json:"tool_timeout"`
+	MaxRequestSize int64             `json:"max_request_size"`
+	ReadTimeout    time.Duration     `json:"read_timeout"`
+	WriteTimeout   time.Duration     `json:"write_timeout"`
+	IdleTimeout    time.Duration     `json:"idle_timeout"`
+	APIKey         string            `json:"api_key"`
+	CORSOrigin     string            `json:"cors_origin"`
+	ToolConfig     ToolManagerConfig `json:"tool_config"`
 }
 
-// 加载配置
+// ToolManagerConfig 工具管理器配置
+type ToolManagerConfig struct {
+	Categories map[string]CategoryConfig `json:"categories"`
+	Global     GlobalToolConfig          `json:"global"`
+}
+
+// CategoryConfig 分类配置
+type CategoryConfig struct {
+	Enabled   bool          `json:"enabled"`
+	MaxTools  int           `json:"max_tools"`
+	RateLimit int           `json:"rate_limit"`
+	Timeout   time.Duration `json:"timeout"`
+}
+
+// GlobalToolConfig 全局工具配置
+type GlobalToolConfig struct {
+	MaxConcurrentCalls int           `json:"max_concurrent_calls"`
+	DefaultTimeout     time.Duration `json:"default_timeout"`
+	EnableMetrics      bool          `json:"enable_metrics"`
+	EnableTracing      bool          `json:"enable_tracing"`
+}
+
+// Load 加载配置
 func Load() (*Config, error) {
+	// 加载 .env 文件
 	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("failed to load .env file: %v", err)
 	}
 
-	// 获取项目根目录
-	projectRoot, err := getProjectRoot()
-	if err != nil {
-		return nil, err
+	cfg := &Config{
+		ServerAddress:  os.Getenv("MCP_SERVER_ADDRESS"),
+		LogLevel:       os.Getenv("MCP_LOG_LEVEL"),
+		LogDir:         os.Getenv("MCP_LOG_DIR"),
+		MaxConnections: parseInt(os.Getenv("MCP_MAX_CONNECTIONS")),
+		ToolTimeout:    parseDuration(os.Getenv("MCP_TOOL_TIMEOUT")),
+		MaxRequestSize: parseInt64(os.Getenv("MCP_MAX_REQUEST_SIZE")),
+		ReadTimeout:    parseDuration(os.Getenv("MCP_READ_TIMEOUT")),
+		WriteTimeout:   parseDuration(os.Getenv("MCP_WRITE_TIMEOUT")),
+		IdleTimeout:    parseDuration(os.Getenv("MCP_IDLE_TIMEOUT")),
+		APIKey:         os.Getenv("MCP_API_KEY"),
+		CORSOrigin:     os.Getenv("MCP_CORS_ORIGIN"),
 	}
 
-	cfg := &Config{
-		ServerAddress:  getEnv("MCP_SERVER_ADDRESS", ":8080"),
-		LogLevel:       getEnv("MCP_LOG_LEVEL", "info"),
-		LogDir:         getEnv("MCP_LOG_DIR", filepath.Join(projectRoot, "log")),
-		MaxConnections: getEnvInt("MCP_MAX_CONNECTIONS", 100),
-		ToolTimeout:    getEnvDuration("MCP_TOOL_TIMEOUT", 30*time.Second),
-		MaxRequestSize: getEnvInt64("MCP_MAX_REQUEST_SIZE", 1048576),
-		ReadTimeout:    getEnvDuration("MCP_READ_TIMEOUT", 15*time.Second),
-		WriteTimeout:   getEnvDuration("MCP_WRITE_TIMEOUT", 15*time.Second),
-		IdleTimeout:    getEnvDuration("MCP_IDLE_TIMEOUT", 60*time.Second),
+	// 加载工具配置文件
+	if err := cfg.loadToolConfigFile(); err != nil {
+		return nil, fmt.Errorf("failed to load tool config: %v", err)
 	}
 
 	return cfg, nil
 }
 
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
+// loadToolConfigFile 加载工具配置文件
+func (c *Config) loadToolConfigFile() error {
+	configPath := os.Getenv("TOOL_CONFIG_PATH")
+	if configPath == "" {
+		configPath = "tool-config.json"
 	}
-	return defaultValue
-}
 
-func getEnvInt(key string, defaultValue int) int {
-	if value := os.Getenv(key); value != "" {
-		if intValue, err := strconv.Atoi(value); err == nil {
-			return intValue
-		}
+	// 如果文件不存在，返回错误
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return fmt.Errorf("tool config file not found: %s", configPath)
 	}
-	return defaultValue
-}
 
-func getEnvInt64(key string, defaultValue int64) int64 {
-	if value := os.Getenv(key); value != "" {
-		if intValue, err := strconv.ParseInt(value, 10, 64); err == nil {
-			return intValue
-		}
-	}
-	return defaultValue
-}
-
-func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if duration, err := time.ParseDuration(value); err == nil {
-			return duration
-		}
-	}
-	return defaultValue
-}
-
-func getProjectRoot() (string, error) {
-	currentDir, err := os.Getwd()
+	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("failed to read tool config file: %v", err)
 	}
-	return currentDir, nil
+
+	var toolConfig ToolManagerConfig
+	if err := json.Unmarshal(data, &toolConfig); err != nil {
+		return fmt.Errorf("failed to parse tool config file: %v", err)
+	}
+
+	c.ToolConfig = toolConfig
+
+	return nil
+}
+
+// parseInt 解析字符串为整数
+func parseInt(s string) int {
+	if s == "" {
+		return 0
+	}
+	if v, err := strconv.Atoi(s); err == nil {
+		return v
+	}
+	return 0
+}
+
+// parseInt64 解析字符串为64位整数
+func parseInt64(s string) int64 {
+	if s == "" {
+		return 0
+	}
+	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return v
+	}
+	return 0
+}
+
+// parseDuration 解析字符串为时间间隔
+func parseDuration(s string) time.Duration {
+	if s == "" {
+		return 0
+	}
+	if v, err := time.ParseDuration(s); err == nil {
+		return v
+	}
+	return 0
 }

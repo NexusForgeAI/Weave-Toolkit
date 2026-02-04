@@ -45,8 +45,6 @@ func main() {
 		}
 	}()
 
-	logMgr.Info().Str("address", cfg.ServerAddress).Msg("MCP server started")
-
 	// 等待中断信号
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
