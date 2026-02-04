@@ -14,6 +14,20 @@ const (
 	MethodToolsCall  = "tools/call"
 )
 
+// MCP 流式响应相关常量
+const (
+	StreamEventToolCall = "tool/call"
+	StreamEventContent  = "content"
+	StreamEventDone     = "done"
+	StreamEventError    = "error"
+)
+
+// 流式响应内容类型
+const (
+	ContentTypeText = "text"
+	ContentTypeJSON = "json"
+)
+
 // InitializeRequest 初始化请求
 type InitializeRequest struct {
 	Method string `json:"method"`
@@ -86,4 +100,33 @@ type ToolCallResult struct {
 type ToolCallContent struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+}
+
+// StreamToolCallRequest 流式工具调用请求
+type StreamToolCallRequest struct {
+	Method string `json:"method"`
+	Params struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+		Stream    bool            `json:"stream,omitempty"` // 是否启用流式响应
+	} `json:"params"`
+}
+
+// StreamEvent 流式事件
+type StreamEvent struct {
+	Event string          `json:"event"`
+	Data  json.RawMessage `json:"data"`
+}
+
+// StreamContent 流式内容
+type StreamContent struct {
+	Type    string `json:"type"`
+	Content string `json:"content"`
+	Index   int    `json:"index,omitempty"` // 内容索引，用于标识顺序
+}
+
+// StreamToolCallResult 流式工具调用结果
+type StreamToolCallResult struct {
+	Content  []StreamContent `json:"content"`
+	IsStream bool            `json:"is_stream"`
 }

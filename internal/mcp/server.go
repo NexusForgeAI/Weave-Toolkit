@@ -105,6 +105,7 @@ func (s *Server) isShuttingDown() bool {
 func (s *Server) setupHTTPServer() {
 	handler := http.NewServeMux()
 	handler.HandleFunc("/mcp", s.handleMCPRequest)
+	handler.HandleFunc("/mcp/stream", s.handleMCPStreamRequest)
 	handler.HandleFunc("/health", s.handleHealthCheck)
 
 	s.httpSrv = &http.Server{
@@ -254,6 +255,136 @@ func (s *Server) handleToolsCall(ctx context.Context, req map[string]interface{}
 	}
 
 	return result, nil
+}
+
+// handleMCPStreamRequest 处理流式 MCP 请求
+func (s *Server) handleMCPStreamRequest(w http.ResponseWriter, r *http.Request) {
+	// 检查服务器是否正在关闭
+	if s.isShuttingDown() {
+		http.Error(w, "Service unavailable - server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 增加活跃操作计数
+	s.activeOps.Add(1)
+	defer s.activeOps.Done()
+
+	// 设置 SSE 响应头
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Cache-Control")
+
+	// 读取请求体
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.sendStreamError(w, "Failed to read request body")
+		return
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		s.sendStreamError(w, "Invalid JSON")
+		return
+	}
+
+	method, ok := req["method"].(string)
+	if !ok {
+		s.sendStreamError(w, "Missing or invalid method")
+		return
+	}
+
+	if method != MethodToolsCall {
+		s.sendStreamError(w, "Streaming only supported for tools/call method")
+		return
+	}
+
+	// 处理流式工具调用
+	s.handleStreamToolsCall(r.Context(), w, req)
+}
+
+// handleStreamToolsCall 处理流式工具调用
+func (s *Server) handleStreamToolsCall(ctx context.Context, w http.ResponseWriter, req map[string]interface{}) {
+	params, ok := req["params"].(map[string]interface{})
+	if !ok {
+		s.sendStreamError(w, "Invalid params")
+		return
+	}
+
+	toolName, ok := params["name"].(string)
+	if !ok {
+		s.sendStreamError(w, "Missing or invalid tool name")
+		return
+	}
+
+	arguments, err := json.Marshal(params["arguments"])
+	if err != nil {
+		s.sendStreamError(w, fmt.Sprintf("Invalid arguments: %v", err))
+		return
+	}
+
+	// 发送开始事件
+	s.sendStreamEvent(w, StreamEventToolCall, map[string]interface{}{
+		"tool":   toolName,
+		"status": "started",
+	})
+
+	// 调用工具并获取流式结果
+	result, err := s.toolMgr.CallToolStream(ctx, toolName, arguments, func(content string, index int) {
+		// 发送内容事件
+		s.sendStreamEvent(w, StreamEventContent, map[string]interface{}{
+			"type":    ContentTypeText,
+			"content": content,
+			"index":   index,
+		})
+	})
+
+	if err != nil {
+		// 发送错误事件
+		s.sendStreamEvent(w, StreamEventError, map[string]interface{}{
+			"message": err.Error(),
+		})
+		return
+	}
+
+	// 发送完成事件
+	s.sendStreamEvent(w, StreamEventDone, map[string]interface{}{
+		"result": result,
+	})
+}
+
+// sendStreamEvent 发送流式事件
+func (s *Server) sendStreamEvent(w http.ResponseWriter, event string, data interface{}) {
+	eventData, err := json.Marshal(data)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to marshal stream event data")
+		return
+	}
+
+	eventStr := fmt.Sprintf("event: %s\ndata: %s\n\n", event, string(eventData))
+
+	if _, err := w.Write([]byte(eventStr)); err != nil {
+		s.logger.Error().Err(err).Msg("Failed to write stream event")
+		return
+	}
+
+	// 刷新缓冲区
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// sendStreamError 发送流式错误
+func (s *Server) sendStreamError(w http.ResponseWriter, message string) {
+	s.sendStreamEvent(w, StreamEventError, map[string]interface{}{
+		"message": message,
+	})
 }
 
 func (s *Server) sendErrorResponse(w http.ResponseWriter, message string, code int) {
