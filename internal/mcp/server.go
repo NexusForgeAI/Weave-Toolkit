@@ -177,6 +177,16 @@ func (s *Server) handleMCPOperation(ctx context.Context, method string, req map[
 		return s.handleToolsList()
 	case MethodToolsCall:
 		return s.handleToolsCall(ctx, req)
+	case MethodResourcesList:
+		return s.handleResourcesList()
+	case MethodResourcesRead:
+		return s.handleResourcesRead(ctx, req)
+	case MethodPromptsList:
+		return s.handlePromptsList()
+	case MethodPromptsGet:
+		return s.handlePromptsGet(ctx, req)
+	case MethodRootsList:
+		return s.handleRootsList()
 	default:
 		return nil, fmt.Errorf("unsupported method: %s", method)
 	}
@@ -255,6 +265,113 @@ func (s *Server) handleToolsCall(ctx context.Context, req map[string]interface{}
 	}
 
 	return result, nil
+}
+
+// handleResourcesList 处理资源列表请求
+func (s *Server) handleResourcesList() (interface{}, error) {
+	// 返回空资源列表（可根据需要扩展）
+	return map[string]interface{}{
+		"resources": []interface{}{},
+	}, nil
+}
+
+// handleResourcesRead 处理资源读取请求
+func (s *Server) handleResourcesRead(ctx context.Context, req map[string]interface{}) (interface{}, error) {
+	params, ok := req["params"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid params")
+	}
+
+	uri, ok := params["uri"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing or invalid uri")
+	}
+
+	// 可以支持文件系统、数据库、HTTP资源等
+	content, err := s.readResource(uri)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read resource: %v", err)
+	}
+
+	return map[string]interface{}{
+		"contents": []map[string]interface{}{
+			{
+				"uri":      uri,
+				"mimeType": "text/plain",
+				"text":     content,
+			},
+		},
+	}, nil
+}
+
+// handlePromptsList 处理提示词列表请求
+func (s *Server) handlePromptsList() (interface{}, error) {
+	// 返回空提示词列表（可根据需要扩展）
+	return map[string]interface{}{
+		"prompts": []interface{}{},
+	}, nil
+}
+
+// handlePromptsGet 处理提示词获取请求
+func (s *Server) handlePromptsGet(ctx context.Context, req map[string]interface{}) (interface{}, error) {
+	params, ok := req["params"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid params")
+	}
+
+	name, ok := params["name"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing or invalid prompt name")
+	}
+
+	// 提示词获取（可根据需要扩展）
+	prompt, err := s.getPrompt(name)
+	if err != nil {
+		return nil, fmt.Errorf("prompt not found: %s", name)
+	}
+
+	return prompt, nil
+}
+
+// handleRootsList 处理根目录列表请求
+func (s *Server) handleRootsList() (interface{}, error) {
+	// 返回空根目录列表（可根据需要扩展）
+	return map[string]interface{}{
+		"roots": []interface{}{},
+	}, nil
+}
+
+// readResource 读取资源内容
+func (s *Server) readResource(uri string) (string, error) {
+	// 可以扩展支持文件系统、HTTP资源等
+	if uri == "file:///example.txt" {
+		return "This is an example resource content.", nil
+	}
+
+	return "", fmt.Errorf("resource not found: %s", uri)
+}
+
+// getPrompt 获取提示词
+func (s *Server) getPrompt(name string) (map[string]interface{}, error) {
+	// 可以扩展支持数据库、配置文件等
+	prompts := map[string]map[string]interface{}{
+		"example_prompt": {
+			"description": "An example prompt for demonstration",
+			"arguments": []map[string]interface{}{
+				{
+					"name":        "topic",
+					"description": "The topic to write about",
+					"required":    true,
+				},
+			},
+		},
+	}
+
+	if prompt, exists := prompts[name]; exists {
+		return prompt, nil
+	}
+
+	return nil, fmt.Errorf("prompt not found")
 }
 
 // handleMCPStreamRequest 处理流式 MCP 请求
