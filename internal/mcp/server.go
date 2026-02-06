@@ -15,15 +15,40 @@ import (
 	"Weave-Toolkit/internal/tools"
 )
 
+// ConnectionPool 连接池
+type ConnectionPool struct {
+	pool    chan *MCPConnection
+	maxSize int
+	active  int
+	mu      sync.RWMutex
+	logger  *logger.Logger
+}
+
+// MCPConnection MCP 连接
+type MCPConnection struct {
+	ID         string
+	ClientInfo *ClientInfo
+	CreatedAt  time.Time
+	LastActive time.Time
+	Session    map[string]interface{}
+}
+
+// ClientInfo 客户端信息
+type ClientInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
 // Server MCP 服务器
 type Server struct {
 	config       *config.Config
 	logger       *logger.Logger
 	httpSrv      *http.Server
 	toolMgr      *tools.ToolManager
-	activeOps    sync.WaitGroup // 等待正在执行的操作
-	shuttingDown bool           // 关闭标志
-	shutdownMu   sync.RWMutex   // 关闭状态锁
+	connPool     *ConnectionPool // 连接池
+	activeOps    sync.WaitGroup  // 等待正在执行的操作
+	shuttingDown bool            // 关闭标志
+	shutdownMu   sync.RWMutex    // 关闭状态锁
 }
 
 // NewServer 创建新的 MCP 服务器
@@ -43,7 +68,114 @@ func NewServer(cfg *config.Config, logger *logger.Logger) (*Server, error) {
 	// 设置 HTTP 服务器
 	server.setupHTTPServer()
 
+	// 初始化连接池
+	maxConnections := 100 // 默认最大连接数
+	if cfg.MaxConnections > 0 {
+		maxConnections = cfg.MaxConnections
+	}
+	server.connPool = NewConnectionPool(maxConnections, logger)
+
 	return server, nil
+}
+
+// NewConnectionPool 创建新的连接池
+func NewConnectionPool(maxSize int, logger *logger.Logger) *ConnectionPool {
+	return &ConnectionPool{
+		pool:    make(chan *MCPConnection, maxSize),
+		maxSize: maxSize,
+		logger:  logger,
+	}
+}
+
+// Acquire 获取连接
+func (cp *ConnectionPool) Acquire(clientInfo *ClientInfo) (*MCPConnection, error) {
+	select {
+	case conn := <-cp.pool:
+		// 从池中获取连接
+		conn.LastActive = time.Now()
+		cp.mu.Lock()
+		cp.active++
+		cp.mu.Unlock()
+		return conn, nil
+	default:
+		// 池为空，创建新连接
+		if cp.active >= cp.maxSize {
+			return nil, fmt.Errorf("connection pool exhausted, max size: %d", cp.maxSize)
+		}
+
+		conn := &MCPConnection{
+			ID:         generateConnectionID(),
+			ClientInfo: clientInfo,
+			CreatedAt:  time.Now(),
+			LastActive: time.Now(),
+			Session:    make(map[string]interface{}),
+		}
+
+		cp.mu.Lock()
+		cp.active++
+		cp.mu.Unlock()
+
+		cp.logger.Debug().
+			Str("connection_id", conn.ID).
+			Str("client", clientInfo.Name).
+			Msg("Created new connection")
+
+		return conn, nil
+	}
+}
+
+// Release 释放连接
+func (cp *ConnectionPool) Release(conn *MCPConnection) {
+	conn.LastActive = time.Now()
+
+	select {
+	case cp.pool <- conn:
+		// 成功放回池中
+		cp.mu.Lock()
+		cp.active--
+		cp.mu.Unlock()
+
+		cp.logger.Debug().
+			Str("connection_id", conn.ID).
+			Msg("Connection released to pool")
+	default:
+		// 池已满，关闭连接
+		cp.mu.Lock()
+		cp.active--
+		cp.mu.Unlock()
+
+		cp.logger.Debug().
+			Str("connection_id", conn.ID).
+			Msg("Connection closed (pool full)")
+	}
+}
+
+// Stats 获取连接池统计信息
+func (cp *ConnectionPool) Stats() map[string]interface{} {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+
+	return map[string]interface{}{
+		"max_size":  cp.maxSize,
+		"active":    cp.active,
+		"pool_size": len(cp.pool),
+		"available": cap(cp.pool) - len(cp.pool),
+	}
+}
+
+// generateConnectionID 生成连接ID
+func generateConnectionID() string {
+	return fmt.Sprintf("conn_%d_%s", time.Now().UnixNano(), randomString(8))
+}
+
+// randomString 生成随机字符串
+func randomString(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[time.Now().UnixNano()%int64(len(charset))]
+	}
+	return string(b)
 }
 
 // Start 启动 MCP 服务器
@@ -102,18 +234,6 @@ func (s *Server) isShuttingDown() bool {
 	return s.shuttingDown
 }
 
-func (s *Server) setupHTTPServer() {
-	handler := http.NewServeMux()
-	handler.HandleFunc("/mcp", s.handleMCPRequest)
-	handler.HandleFunc("/mcp/stream", s.handleMCPStreamRequest)
-	handler.HandleFunc("/health", s.handleHealthCheck)
-
-	s.httpSrv = &http.Server{
-		Addr:    s.config.ServerAddress,
-		Handler: handler,
-	}
-}
-
 func (s *Server) handleMCPRequest(w http.ResponseWriter, r *http.Request) {
 	// 检查服务器是否正在关闭
 	if s.isShuttingDown() {
@@ -150,8 +270,20 @@ func (s *Server) handleMCPRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 获取客户端信息并创建连接
+	clientInfo := extractClientInfo(req)
+	conn, err := s.connPool.Acquire(clientInfo)
+	if err != nil {
+		s.sendErrorResponse(w, fmt.Sprintf("Connection limit exceeded: %v", err), -32000)
+		return
+	}
+	defer s.connPool.Release(conn)
+
+	// 在处理请求前更新连接活跃时间
+	conn.LastActive = time.Now()
+
 	// 处理 MCP 请求
-	result, err := s.handleMCPOperation(r.Context(), method, req)
+	result, err := s.handleMCPOperation(r.Context(), method, req, conn)
 	if err != nil {
 		s.sendErrorResponse(w, err.Error(), -32603)
 		return
@@ -167,7 +299,7 @@ func (s *Server) handleMCPRequest(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func (s *Server) handleMCPOperation(ctx context.Context, method string, req map[string]interface{}) (interface{}, error) {
+func (s *Server) handleMCPOperation(ctx context.Context, method string, req map[string]interface{}, conn *MCPConnection) (interface{}, error) {
 	switch method {
 	case MethodInitialize:
 		return s.handleInitialize(req)
@@ -176,15 +308,15 @@ func (s *Server) handleMCPOperation(ctx context.Context, method string, req map[
 	case MethodToolsList:
 		return s.handleToolsList()
 	case MethodToolsCall:
-		return s.handleToolsCall(ctx, req)
+		return s.handleToolsCall(ctx, req, conn)
 	case MethodResourcesList:
 		return s.handleResourcesList()
 	case MethodResourcesRead:
-		return s.handleResourcesRead(ctx, req)
+		return s.handleResourcesRead(ctx, req, conn)
 	case MethodPromptsList:
 		return s.handlePromptsList()
 	case MethodPromptsGet:
-		return s.handlePromptsGet(ctx, req)
+		return s.handlePromptsGet(ctx, req, conn)
 	case MethodRootsList:
 		return s.handleRootsList()
 	default:
@@ -243,7 +375,7 @@ func (s *Server) handleToolsList() (interface{}, error) {
 	}, nil
 }
 
-func (s *Server) handleToolsCall(ctx context.Context, req map[string]interface{}) (interface{}, error) {
+func (s *Server) handleToolsCall(ctx context.Context, req map[string]interface{}, conn *MCPConnection) (interface{}, error) {
 	params, ok := req["params"].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("invalid params")
@@ -276,7 +408,7 @@ func (s *Server) handleResourcesList() (interface{}, error) {
 }
 
 // handleResourcesRead 处理资源读取请求
-func (s *Server) handleResourcesRead(ctx context.Context, req map[string]interface{}) (interface{}, error) {
+func (s *Server) handleResourcesRead(ctx context.Context, req map[string]interface{}, conn *MCPConnection) (interface{}, error) {
 	params, ok := req["params"].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("invalid params")
@@ -313,7 +445,7 @@ func (s *Server) handlePromptsList() (interface{}, error) {
 }
 
 // handlePromptsGet 处理提示词获取请求
-func (s *Server) handlePromptsGet(ctx context.Context, req map[string]interface{}) (interface{}, error) {
+func (s *Server) handlePromptsGet(ctx context.Context, req map[string]interface{}, conn *MCPConnection) (interface{}, error) {
 	params, ok := req["params"].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("invalid params")
@@ -372,6 +504,71 @@ func (s *Server) getPrompt(name string) (map[string]interface{}, error) {
 	}
 
 	return nil, fmt.Errorf("prompt not found")
+}
+
+// extractClientInfo 从请求中提取客户端信息
+func extractClientInfo(req map[string]interface{}) *ClientInfo {
+	clientInfo := &ClientInfo{
+		Name:    "unknown",
+		Version: "1.0.0",
+	}
+
+	// 尝试从初始化请求中获取客户端信息
+	if params, ok := req["params"].(map[string]interface{}); ok {
+		if client, ok := params["clientInfo"].(map[string]interface{}); ok {
+			if name, ok := client["name"].(string); ok {
+				clientInfo.Name = name
+			}
+			if version, ok := client["version"].(string); ok {
+				clientInfo.Version = version
+			}
+		}
+	}
+
+	return clientInfo
+}
+
+// setupHTTPServer 设置 HTTP 服务器
+func (s *Server) setupHTTPServer() {
+	mux := http.NewServeMux()
+
+	// MCP 协议端点
+	mux.HandleFunc("/mcp", s.handleMCPRequest)
+	mux.HandleFunc("/mcp/stream", s.handleMCPStreamRequest)
+
+	// 新增健康检查端点
+	mux.HandleFunc("/health", s.handleHealthCheck)
+	mux.HandleFunc("/stats", s.handleStats)
+
+	s.httpSrv = &http.Server{
+		Addr:         s.config.ServerAddress,
+		Handler:      mux,
+		ReadTimeout:  s.config.ReadTimeout,
+		WriteTimeout: s.config.WriteTimeout,
+		IdleTimeout:  s.config.IdleTimeout,
+	}
+}
+
+// handleStats 统计信息端点
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	stats := s.connPool.Stats()
+
+	response := map[string]interface{}{
+		"server_info": map[string]interface{}{
+			"name":    "Weave-Toolkit",
+			"version": "1.0.0",
+		},
+		"connections": stats,
+		"timestamp":   time.Now().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // handleMCPStreamRequest 处理流式 MCP 请求
