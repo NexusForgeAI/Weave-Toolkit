@@ -5,17 +5,18 @@
   <img src="https://img.shields.io/badge/Tool-MCP-FF6F00?style=for-the-badge&logo=tool&logoColor=white" alt="Tool MCP">
 </div>
 
-基于 Golang 高性能 MCP (Model Context Protocol) 工具服务器，可为 [Weave](https://github.com/liaotxcn/Weave) 平台提供可扩展的工具服务
+基于 Golang 高性能 MCP (Model Context Protocol) 服务器，可为 [Weave](https://github.com/liaotxcn/Weave) 平台提供可扩展服务
 
 ---
 
 ## 🚀 特性
 
-- **MCP 协议支持** 
-- **工具分类管理** 
-- **配置驱动** 
-- **高性能** 
-- **结构化日志** 
+- **完整 MCP 协议支持** - 支持 tools、resources、prompts、roots 等协议
+- **流式响应支持** - Server-Sent Events (SSE) 流式工具调用
+- **高性能架构** - 基于 Gin 框架，连接池管理，优化路由性能
+- **模块化中间件** - 日志、崩溃恢复、请求ID追踪等中间件
+- **配置驱动** - 灵活的配置管理和环境变量支持
+- **安全防护** - 连接限制、错误处理、结构化日志 
 
 ---
 
@@ -65,12 +66,22 @@ type Tool interface {
 
 - `POST /mcp` - MCP 协议主端点
 - `GET /health` - 健康检查端点
+- `GET /health/stats` - 服务器统计信息端点
 
-### 协议方法
+### 支持的协议方法
 
+#### 核心方法
 - `initialize` - 初始化连接
 - `tools/list` - 获取可用工具列表
 - `tools/call` - 调用具体工具
+- `tools/call` (流式) - 流式调用工具，支持实时输出
+
+#### 扩展方法
+- `resources/list` - 获取资源列表
+- `resources/read` - 读取资源内容
+- `prompts/list` - 获取提示词列表  
+- `prompts/get` - 获取特定提示词
+- `roots/list` - 获取根目录列表
 
 ### 项目结构
 
@@ -82,6 +93,7 @@ Weave-Toolkit/
 │   ├── logger/         # 日志系统
 │   ├── mcp/            # MCP 协议
 │   └── tools/          # 工具管理
+├── middleware/         # 中间件
 ├── .env                # 环境配置
 └── tool-config.json    # 工具配置
 ```

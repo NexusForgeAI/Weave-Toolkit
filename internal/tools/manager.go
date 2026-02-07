@@ -52,6 +52,15 @@ type Tool interface {
 	Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error)
 }
 
+// StreamTool 流式工具接口
+type StreamTool interface {
+	Tool
+	ExecuteStream(ctx context.Context, args json.RawMessage, callback func(content string, index int)) (json.RawMessage, error)
+}
+
+// StreamCallback 流式回调函数类型
+type StreamCallback func(content string, index int)
+
 // ToolInfo 工具信息结构
 type ToolInfo struct {
 	Name        string       `json:"name"`
@@ -159,6 +168,7 @@ func (tm *ToolManager) RegisterTool(tool Tool) error {
 // RegisterAllTools 注册所有可用工具
 func (tm *ToolManager) RegisterAllTools() {
 	tm.RegisterTool(&CalculatorTool{})
+	tm.RegisterTool(&StreamTextProcessor{})
 	// 添加更多工具
 }
 
@@ -331,6 +341,91 @@ func (tm *ToolManager) CallTool(ctx context.Context, name string, args json.RawM
 			Str("category", string(category)).
 			Dur("duration", duration).
 			Msg("Tool call completed successfully")
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// MCP 兼容格式
+	return &ToolCallResult{
+		Content: []ToolCallContent{
+			{
+				Type: "text",
+				Text: string(result),
+			},
+		},
+	}, nil
+}
+
+// CallToolStream 流式调用工具
+func (tm *ToolManager) CallToolStream(ctx context.Context, name string, args json.RawMessage, callback StreamCallback) (*ToolCallResult, error) {
+	startTime := time.Now()
+
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	// 在所有分类中查找工具
+	var tool Tool
+	var category ToolCategory
+
+	for cat, categoryMgr := range tm.categories {
+		if !categoryMgr.enabled {
+			continue
+		}
+
+		if t, exists := categoryMgr.tools[name]; exists {
+			tool = t
+			category = cat
+			break
+		}
+	}
+
+	if tool == nil {
+		tm.logger.Error().Str("tool", name).Msg("Tool not found")
+		return nil, fmt.Errorf("tool not found: %s", name)
+	}
+
+	// 检查工具是否支持流式调用
+	streamTool, supportsStream := tool.(StreamTool)
+	if !supportsStream {
+		tm.logger.Warn().Str("tool", name).Msg("Tool does not support streaming, returning regular execution result")
+		// 若不支持流式，返回普通调用结果
+		return tm.CallTool(ctx, name, args)
+	}
+
+	// 应用分类级别的超时设置
+	categoryMgr := tm.categories[category]
+	if categoryMgr.config.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, categoryMgr.config.Timeout)
+		defer cancel()
+	}
+
+	// 记录流式工具调用开始
+	tm.logger.Info().
+		Str("tool", name).
+		Str("category", string(category)).
+		RawJSON("args", args).
+		Msg("Stream tool call started")
+
+	result, err := streamTool.ExecuteStream(ctx, args, callback)
+	duration := time.Since(startTime)
+
+	// 记录流式工具调用结果
+	if err != nil {
+		tm.logger.Error().
+			Str("tool", name).
+			Str("category", string(category)).
+			Dur("duration", duration).
+			Err(err).
+			Msg("Stream tool call failed")
+	} else {
+		tm.logger.Info().
+			Str("tool", name).
+			Str("category", string(category)).
+			Dur("duration", duration).
+			Msg("Stream tool call completed successfully")
 	}
 
 	if err != nil {

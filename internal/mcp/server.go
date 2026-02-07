@@ -1,29 +1,56 @@
 package mcp
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"Weave-Toolkit/config"
 	"Weave-Toolkit/internal/logger"
 	"Weave-Toolkit/internal/tools"
+	"Weave-Toolkit/middleware"
 )
+
+// ConnectionPool 连接池
+type ConnectionPool struct {
+	pool    chan *MCPConnection
+	maxSize int
+	active  int
+	mu      sync.RWMutex
+	logger  *logger.Logger
+}
+
+// MCPConnection MCP 连接
+type MCPConnection struct {
+	ID         string
+	ClientInfo *ClientInfo
+	CreatedAt  time.Time
+	LastActive time.Time
+	Session    map[string]interface{}
+}
+
+// ClientInfo 客户端信息
+type ClientInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
 
 // Server MCP 服务器
 type Server struct {
 	config       *config.Config
 	logger       *logger.Logger
+	ginEngine    *gin.Engine
 	httpSrv      *http.Server
 	toolMgr      *tools.ToolManager
-	activeOps    sync.WaitGroup // 等待正在执行的操作
-	shuttingDown bool           // 关闭标志
-	shutdownMu   sync.RWMutex   // 关闭状态锁
+	connPool     *ConnectionPool // 连接池
+	activeOps    sync.WaitGroup  // 等待正在执行的操作
+	shuttingDown bool            // 关闭标志
+	shutdownMu   sync.RWMutex    // 关闭状态锁
 }
 
 // NewServer 创建新的 MCP 服务器
@@ -40,10 +67,116 @@ func NewServer(cfg *config.Config, logger *logger.Logger) (*Server, error) {
 		toolMgr: toolManager,
 	}
 
-	// 设置 HTTP 服务器
-	server.setupHTTPServer()
+	server.setupGinServer()
+
+	// 初始化连接池
+	maxConnections := 100 // 默认最大连接数
+	if cfg.MaxConnections > 0 {
+		maxConnections = cfg.MaxConnections
+	}
+	server.connPool = NewConnectionPool(maxConnections, logger)
 
 	return server, nil
+}
+
+// NewConnectionPool 创建新的连接池
+func NewConnectionPool(maxSize int, logger *logger.Logger) *ConnectionPool {
+	return &ConnectionPool{
+		pool:    make(chan *MCPConnection, maxSize),
+		maxSize: maxSize,
+		logger:  logger,
+	}
+}
+
+// Acquire 获取连接
+func (cp *ConnectionPool) Acquire(clientInfo *ClientInfo) (*MCPConnection, error) {
+	select {
+	case conn := <-cp.pool:
+		// 从池中获取连接
+		conn.LastActive = time.Now()
+		cp.mu.Lock()
+		cp.active++
+		cp.mu.Unlock()
+		return conn, nil
+	default:
+		// 池为空，创建新连接
+		if cp.active >= cp.maxSize {
+			return nil, fmt.Errorf("connection pool exhausted, max size: %d", cp.maxSize)
+		}
+
+		conn := &MCPConnection{
+			ID:         generateConnectionID(),
+			ClientInfo: clientInfo,
+			CreatedAt:  time.Now(),
+			LastActive: time.Now(),
+			Session:    make(map[string]interface{}),
+		}
+
+		cp.mu.Lock()
+		cp.active++
+		cp.mu.Unlock()
+
+		cp.logger.Debug().
+			Str("connection_id", conn.ID).
+			Str("client", clientInfo.Name).
+			Msg("Created new connection")
+
+		return conn, nil
+	}
+}
+
+// Release 释放连接
+func (cp *ConnectionPool) Release(conn *MCPConnection) {
+	conn.LastActive = time.Now()
+
+	select {
+	case cp.pool <- conn:
+		// 成功放回池中
+		cp.mu.Lock()
+		cp.active--
+		cp.mu.Unlock()
+
+		cp.logger.Debug().
+			Str("connection_id", conn.ID).
+			Msg("Connection released to pool")
+	default:
+		// 池已满，关闭连接
+		cp.mu.Lock()
+		cp.active--
+		cp.mu.Unlock()
+
+		cp.logger.Debug().
+			Str("connection_id", conn.ID).
+			Msg("Connection closed (pool full)")
+	}
+}
+
+// Stats 获取连接池统计信息
+func (cp *ConnectionPool) Stats() map[string]interface{} {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+
+	return map[string]interface{}{
+		"max_size":  cp.maxSize,
+		"active":    cp.active,
+		"pool_size": len(cp.pool),
+		"available": cap(cp.pool) - len(cp.pool),
+	}
+}
+
+// generateConnectionID 生成连接ID
+func generateConnectionID() string {
+	return fmt.Sprintf("conn_%d_%s", time.Now().UnixNano(), randomString(8))
+}
+
+// randomString 生成随机字符串
+func randomString(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[time.Now().UnixNano()%int64(len(charset))]
+	}
+	return string(b)
 }
 
 // Start 启动 MCP 服务器
@@ -102,26 +235,12 @@ func (s *Server) isShuttingDown() bool {
 	return s.shuttingDown
 }
 
-func (s *Server) setupHTTPServer() {
-	handler := http.NewServeMux()
-	handler.HandleFunc("/mcp", s.handleMCPRequest)
-	handler.HandleFunc("/health", s.handleHealthCheck)
-
-	s.httpSrv = &http.Server{
-		Addr:    s.config.ServerAddress,
-		Handler: handler,
-	}
-}
-
-func (s *Server) handleMCPRequest(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleMCPRequest(c *gin.Context) {
 	// 检查服务器是否正在关闭
 	if s.isShuttingDown() {
-		http.Error(w, "Service unavailable - server is shutting down", http.StatusServiceUnavailable)
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Service unavailable - server is shutting down",
+		})
 		return
 	}
 
@@ -129,44 +248,46 @@ func (s *Server) handleMCPRequest(w http.ResponseWriter, r *http.Request) {
 	s.activeOps.Add(1)
 	defer s.activeOps.Done()
 
-	// 读取请求体
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.sendErrorResponse(w, "Failed to read request body", -32700)
-		return
-	}
-	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
+	// 绑定 JSON 请求体
 	var req map[string]interface{}
-	if err := json.NewDecoder(bytes.NewBuffer(bodyBytes)).Decode(&req); err != nil {
-		s.sendErrorResponse(w, "Invalid JSON", -32700)
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.sendGinErrorResponse(c, "Invalid JSON", -32700)
 		return
 	}
 
 	method, ok := req["method"].(string)
 	if !ok {
-		s.sendErrorResponse(w, "Missing or invalid method", -32600)
+		s.sendGinErrorResponse(c, "Missing or invalid method", -32600)
 		return
 	}
+
+	// 获取客户端信息并创建连接
+	clientInfo := extractClientInfo(req)
+	conn, err := s.connPool.Acquire(clientInfo)
+	if err != nil {
+		s.sendGinErrorResponse(c, fmt.Sprintf("Connection limit exceeded: %v", err), -32000)
+		return
+	}
+	defer s.connPool.Release(conn)
+
+	// 在处理请求前更新连接活跃时间
+	conn.LastActive = time.Now()
 
 	// 处理 MCP 请求
-	result, err := s.handleMCPOperation(r.Context(), method, req)
+	result, err := s.handleMCPOperation(c.Request.Context(), method, req, conn)
 	if err != nil {
-		s.sendErrorResponse(w, err.Error(), -32603)
+		s.sendGinErrorResponse(c, err.Error(), -32603)
 		return
 	}
 
-	response := map[string]interface{}{
+	c.JSON(http.StatusOK, gin.H{
 		"jsonrpc": "2.0",
 		"result":  result,
 		"id":      req["id"],
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	})
 }
 
-func (s *Server) handleMCPOperation(ctx context.Context, method string, req map[string]interface{}) (interface{}, error) {
+func (s *Server) handleMCPOperation(ctx context.Context, method string, req map[string]interface{}, conn *MCPConnection) (interface{}, error) {
 	switch method {
 	case MethodInitialize:
 		return s.handleInitialize(req)
@@ -175,7 +296,17 @@ func (s *Server) handleMCPOperation(ctx context.Context, method string, req map[
 	case MethodToolsList:
 		return s.handleToolsList()
 	case MethodToolsCall:
-		return s.handleToolsCall(ctx, req)
+		return s.handleToolsCall(ctx, req, conn)
+	case MethodResourcesList:
+		return s.handleResourcesList()
+	case MethodResourcesRead:
+		return s.handleResourcesRead(ctx, req, conn)
+	case MethodPromptsList:
+		return s.handlePromptsList()
+	case MethodPromptsGet:
+		return s.handlePromptsGet(ctx, req, conn)
+	case MethodRootsList:
+		return s.handleRootsList()
 	default:
 		return nil, fmt.Errorf("unsupported method: %s", method)
 	}
@@ -232,7 +363,7 @@ func (s *Server) handleToolsList() (interface{}, error) {
 	}, nil
 }
 
-func (s *Server) handleToolsCall(ctx context.Context, req map[string]interface{}) (interface{}, error) {
+func (s *Server) handleToolsCall(ctx context.Context, req map[string]interface{}, conn *MCPConnection) (interface{}, error) {
 	params, ok := req["params"].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("invalid params")
@@ -256,6 +387,336 @@ func (s *Server) handleToolsCall(ctx context.Context, req map[string]interface{}
 	return result, nil
 }
 
+// handleResourcesList 处理资源列表请求
+func (s *Server) handleResourcesList() (interface{}, error) {
+	// 返回空资源列表（可根据需要扩展）
+	return map[string]interface{}{
+		"resources": []interface{}{},
+	}, nil
+}
+
+// handleResourcesRead 处理资源读取请求
+func (s *Server) handleResourcesRead(ctx context.Context, req map[string]interface{}, conn *MCPConnection) (interface{}, error) {
+	params, ok := req["params"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid params")
+	}
+
+	uri, ok := params["uri"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing or invalid uri")
+	}
+
+	// 可以支持文件系统、数据库、HTTP资源等
+	content, err := s.readResource(uri)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read resource: %v", err)
+	}
+
+	return map[string]interface{}{
+		"contents": []map[string]interface{}{
+			{
+				"uri":      uri,
+				"mimeType": "text/plain",
+				"text":     content,
+			},
+		},
+	}, nil
+}
+
+// handlePromptsList 处理提示词列表请求
+func (s *Server) handlePromptsList() (interface{}, error) {
+	// 返回空提示词列表（可根据需要扩展）
+	return map[string]interface{}{
+		"prompts": []interface{}{},
+	}, nil
+}
+
+// handlePromptsGet 处理提示词获取请求
+func (s *Server) handlePromptsGet(ctx context.Context, req map[string]interface{}, conn *MCPConnection) (interface{}, error) {
+	params, ok := req["params"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid params")
+	}
+
+	name, ok := params["name"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing or invalid prompt name")
+	}
+
+	// 提示词获取（可根据需要扩展）
+	prompt, err := s.getPrompt(name)
+	if err != nil {
+		return nil, fmt.Errorf("prompt not found: %s", name)
+	}
+
+	return prompt, nil
+}
+
+// handleRootsList 处理根目录列表请求
+func (s *Server) handleRootsList() (interface{}, error) {
+	// 返回空根目录列表（可根据需要扩展）
+	return map[string]interface{}{
+		"roots": []interface{}{},
+	}, nil
+}
+
+// readResource 读取资源内容
+func (s *Server) readResource(uri string) (string, error) {
+	// 可以扩展支持文件系统、HTTP资源等
+	if uri == "file:///example.txt" {
+		return "This is an example resource content.", nil
+	}
+
+	return "", fmt.Errorf("resource not found: %s", uri)
+}
+
+// getPrompt 获取提示词
+func (s *Server) getPrompt(name string) (map[string]interface{}, error) {
+	// 可以扩展支持数据库、配置文件等
+	prompts := map[string]map[string]interface{}{
+		"example_prompt": {
+			"description": "An example prompt for demonstration",
+			"arguments": []map[string]interface{}{
+				{
+					"name":        "topic",
+					"description": "The topic to write about",
+					"required":    true,
+				},
+			},
+		},
+	}
+
+	if prompt, exists := prompts[name]; exists {
+		return prompt, nil
+	}
+
+	return nil, fmt.Errorf("prompt not found")
+}
+
+// extractClientInfo 从请求中提取客户端信息
+func extractClientInfo(req map[string]interface{}) *ClientInfo {
+	clientInfo := &ClientInfo{
+		Name:    "unknown",
+		Version: "1.0.0",
+	}
+
+	// 尝试从初始化请求中获取客户端信息
+	if params, ok := req["params"].(map[string]interface{}); ok {
+		if client, ok := params["clientInfo"].(map[string]interface{}); ok {
+			if name, ok := client["name"].(string); ok {
+				clientInfo.Name = name
+			}
+			if version, ok := client["version"].(string); ok {
+				clientInfo.Version = version
+			}
+		}
+	}
+
+	return clientInfo
+}
+
+// setupGinServer 设置 Gin 服务器
+func (s *Server) setupGinServer() {
+	// 模式
+	if s.config.LogLevel == "debug" {
+		gin.SetMode(gin.DebugMode)
+	} else {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
+	s.ginEngine = gin.New()
+
+	// 全局中间件
+	s.ginEngine.Use(
+		middleware.LoggingMiddleware(s.logger),  // 日志中间件
+		middleware.RecoveryMiddleware(s.logger), // 崩溃恢复
+		middleware.RequestIDMiddleware(),        // 请求 ID 追踪
+	)
+
+	// MCP 协议端点
+	mcpGroup := s.ginEngine.Group("/mcp")
+	{
+		mcpGroup.POST("", s.handleMCPRequest)
+		mcpGroup.POST("/stream", s.handleMCPStreamRequest)
+	}
+
+	// 健康检查端点
+	healthGroup := s.ginEngine.Group("/health")
+	{
+		healthGroup.GET("", s.handleHealthCheck)
+		healthGroup.GET("/stats", s.handleStats)
+	}
+
+	// 设置 HTTP 服务器
+	s.httpSrv = &http.Server{
+		Addr:         s.config.ServerAddress,
+		Handler:      s.ginEngine,
+		ReadTimeout:  s.config.ReadTimeout,
+		WriteTimeout: s.config.WriteTimeout,
+		IdleTimeout:  s.config.IdleTimeout,
+	}
+}
+
+// handleStats 统计信息端点
+func (s *Server) handleStats(c *gin.Context) {
+	stats := s.connPool.Stats()
+
+	c.JSON(http.StatusOK, gin.H{
+		"server_info": gin.H{
+			"name":    "Weave-Toolkit",
+			"version": "1.0.0",
+		},
+		"connections": stats,
+		"timestamp":   time.Now().Format(time.RFC3339),
+	})
+}
+
+// handleMCPStreamRequest 处理流式 MCP 请求
+func (s *Server) handleMCPStreamRequest(c *gin.Context) {
+	// 检查服务器是否正在关闭
+	if s.isShuttingDown() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Service unavailable - server is shutting down",
+		})
+		return
+	}
+
+	// 增加活跃操作计数
+	s.activeOps.Add(1)
+	defer s.activeOps.Done()
+
+	// 设置 SSE 响应头
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+	c.Writer.Header().Set("Access-Control-Allow-Headers", "Cache-Control")
+
+	// 绑定 JSON 请求体
+	var req map[string]interface{}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.sendStreamError(c.Writer, "Invalid JSON")
+		return
+	}
+
+	method, ok := req["method"].(string)
+	if !ok {
+		s.sendStreamError(c.Writer, "Missing or invalid method")
+		return
+	}
+
+	if method != MethodToolsCall {
+		s.sendStreamError(c.Writer, "Only tools/call method is supported for streaming")
+		return
+	}
+
+	// 获取客户端信息并创建连接
+	clientInfo := extractClientInfo(req)
+	conn, err := s.connPool.Acquire(clientInfo)
+	if err != nil {
+		s.sendStreamError(c.Writer, fmt.Sprintf("Connection limit exceeded: %v", err))
+		return
+	}
+	defer s.connPool.Release(conn)
+
+	// 在处理请求前更新连接活跃时间
+	conn.LastActive = time.Now()
+
+	// 处理流式工具调用
+	s.handleStreamToolsCall(c.Request.Context(), c.Writer, req, conn)
+}
+
+// handleStreamToolsCall 处理流式工具调用
+func (s *Server) handleStreamToolsCall(ctx context.Context, w http.ResponseWriter, req map[string]interface{}, conn *MCPConnection) {
+	params, ok := req["params"].(map[string]interface{})
+	if !ok {
+		s.sendStreamError(w, "Invalid params")
+		return
+	}
+
+	toolName, ok := params["name"].(string)
+	if !ok {
+		s.sendStreamError(w, "Missing or invalid tool name")
+		return
+	}
+
+	arguments, err := json.Marshal(params["arguments"])
+	if err != nil {
+		s.sendStreamError(w, fmt.Sprintf("Invalid arguments: %v", err))
+		return
+	}
+
+	// 发送开始事件
+	s.sendStreamEvent(w, StreamEventToolCall, map[string]interface{}{
+		"tool":   toolName,
+		"status": "started",
+	})
+
+	// 调用工具并获取流式结果
+	result, err := s.toolMgr.CallToolStream(ctx, toolName, arguments, func(content string, index int) {
+		// 发送内容事件
+		s.sendStreamEvent(w, StreamEventContent, map[string]interface{}{
+			"type":    ContentTypeText,
+			"content": content,
+			"index":   index,
+		})
+	})
+
+	if err != nil {
+		// 发送错误事件
+		s.sendStreamEvent(w, StreamEventError, map[string]interface{}{
+			"message": err.Error(),
+		})
+		return
+	}
+
+	// 发送完成事件
+	s.sendStreamEvent(w, StreamEventDone, map[string]interface{}{
+		"result": result,
+	})
+}
+
+// sendStreamEvent 发送流式事件
+func (s *Server) sendStreamEvent(w http.ResponseWriter, event string, data interface{}) {
+	eventData, err := json.Marshal(data)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to marshal stream event data")
+		return
+	}
+
+	eventStr := fmt.Sprintf("event: %s\ndata: %s\n\n", event, string(eventData))
+
+	if _, err := w.Write([]byte(eventStr)); err != nil {
+		s.logger.Error().Err(err).Msg("Failed to write stream event")
+		return
+	}
+
+	// 刷新缓冲区
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// sendStreamError 发送流式错误
+func (s *Server) sendStreamError(w http.ResponseWriter, message string) {
+	s.sendStreamEvent(w, StreamEventError, map[string]interface{}{
+		"message": message,
+	})
+}
+
+// sendGinErrorResponse 错误响应
+func (s *Server) sendGinErrorResponse(c *gin.Context, message string, code int) {
+	c.JSON(http.StatusOK, gin.H{
+		"jsonrpc": "2.0",
+		"error": gin.H{
+			"code":    code,
+			"message": message,
+		},
+		"id": nil,
+	})
+}
+
 func (s *Server) sendErrorResponse(w http.ResponseWriter, message string, code int) {
 	response := map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -271,8 +732,13 @@ func (s *Server) sendErrorResponse(w http.ResponseWriter, message string, code i
 	json.NewEncoder(w).Encode(response)
 }
 
-func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status": "healthy"}`))
+// handleHealthCheck 健康检查端点
+func (s *Server) handleHealthCheck(c *gin.Context) {
+	stats := s.connPool.Stats()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":      "healthy",
+		"timestamp":   time.Now().Format(time.RFC3339),
+		"connections": stats,
+	})
 }
