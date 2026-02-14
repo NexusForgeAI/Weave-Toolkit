@@ -32,7 +32,6 @@ WORKDIR /app
 COPY --from=builder /app/mcp-server .
 
 # 复制配置文件
-COPY .env ./
 COPY tool-config.json ./
 
 # 更改文件所有权
