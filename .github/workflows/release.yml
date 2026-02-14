@@ -7,47 +7,28 @@ on:
 
 jobs:
   release:
-    name: Create Release
+    name: Build and Release
     runs-on: ubuntu-latest
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        
-    - name: Set up Go
+      
+    - name: Setup Go
       uses: actions/setup-go@v4
       with:
         go-version: '1.23'
+        cache: true
         
-    - name: Build application
+    - name: Build
       run: |
         mkdir -p bin
         go build -o bin/mcp-server ./cmd/mcp-server
         
-    - name: Get version from tag
-      id: get_version
-      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-        
     - name: Create Release
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: ${{ github.ref }}
-        name: Release ${{ github.ref_name }}
-        body: |
-          Weave Toolkit MCP Server ${{ github.ref_name }}
-          
-          ## Changes
-          
-          See the commit history for detailed changes.
-        draft: false
-        prerelease: false
-        files: |
-          bin/mcp-server
-          README.md
-        
-    - name: Upload binary to release
+        files: bin/mcp-server
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
